@@ -1,4 +1,4 @@
- # For below listed languages please use the predifined names: 
+ # For below listed languages please use the predifined names to scrape their rules: 
 
 1. C++ -> cpp
 2. C# -> csharp
