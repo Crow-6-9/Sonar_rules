@@ -5,6 +5,7 @@ import json
 import logging
 from typing import List, Dict, Optional
 from colorama import Fore, Style, init
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 init(autoreset=True)
 
@@ -25,16 +26,17 @@ class ColorFormatter(logging.Formatter):
 
 
 class CheckstyleScraper:
-    def __init__(self, category: str):
+    def __init__(self, category: str, max_workers: int = 8):
         self.category = category.lower().strip()
         self.base_url = f"https://checkstyle.org/checks/{self.category}/"
         self.index_url = urljoin(self.base_url, "index.html")
+        self.max_workers = max_workers
 
-        # Logger setup with color
+        # Logger setup
         handler = logging.StreamHandler()
         handler.setFormatter(ColorFormatter("%(asctime)s [%(levelname)s] %(message)s"))
         self.logger = logging.getLogger(self.category.capitalize())
-        self.logger.setLevel(logging.DEBUG)
+        self.logger.setLevel(logging.INFO)
         self.logger.addHandler(handler)
 
         self.logger.info(f"Initialized scraper for category: {self.category}")
@@ -42,7 +44,7 @@ class CheckstyleScraper:
     # ------------------------ UTILITIES ------------------------
 
     def fetch_soup(self, url: str) -> Optional[BeautifulSoup]:
-        """Fetch and parse HTML."""
+        """Fetch and parse HTML content."""
         try:
             self.logger.debug(f"Fetching URL: {url}")
             if (response := requests.get(url, timeout=15)).status_code == 200:
@@ -54,14 +56,12 @@ class CheckstyleScraper:
     # ------------------------ EXTRACTION LOGIC ------------------------
 
     def extract_checkstyle_info(self, soup: BeautifulSoup) -> Optional[str]:
-        """Extract 'Since Checkstyle X.X' text."""
         for p in soup.find_all("p"):
             if (text := p.get_text(" ", strip=True)).startswith("Since Checkstyle"):
                 return text
         return None
 
     def extract_description(self, section: BeautifulSoup) -> Optional[str]:
-        """Extract paragraphs, code, lists, and table text."""
         if not section:
             return None
         parts: List[str] = []
@@ -86,7 +86,6 @@ class CheckstyleScraper:
         return "\n\n".join(parts).strip() if parts else None
 
     def extract_properties(self, section: BeautifulSoup) -> List[Dict[str, str]]:
-        """Extract table of properties."""
         properties = []
         if not section or not (table := section.find("table")):
             return properties
@@ -113,6 +112,7 @@ class CheckstyleScraper:
         return examples
 
     def extract_rule_details(self, rule_url: str, rule_name: str) -> Optional[Dict]:
+        """Extract all rule details from a single rule page."""
         self.logger.info(f"{Fore.GREEN}Extracting rule: {rule_name}{Style.RESET_ALL}")
         if not (soup := self.fetch_soup(rule_url)):
             return None
@@ -141,37 +141,51 @@ class CheckstyleScraper:
             "examples": examples or None
         }
 
-    # ------------------------ MAIN SCRAPER LOGIC ------------------------
+    # ------------------------ PARALLEL SCRAPER ------------------------
 
     def scrape(self) -> Dict:
+        """Main scraping method with parallel rule extraction."""
         self.logger.info(f"Fetching index page: {self.index_url}")
         if not (soup := self.fetch_soup(self.index_url)):
             self.logger.error("Failed to load index page.")
             return {}
 
-        rules_data = []
+        rules: List[Dict] = []
+        rule_links = []
 
         for td in soup.find_all("td"):
             if not (a_tag := td.find("a")) or not a_tag.has_attr("href"):
                 continue
-
             rule_url = urljoin(self.base_url, a_tag["href"].split("#")[0])
             rule_name = a_tag.get_text(strip=True)
+            rule_links.append((rule_url, rule_name))
 
-            if details := self.extract_rule_details(rule_url, rule_name):
-                rules_data.append(details)
+        total_rules = len(rule_links)
+        self.logger.info(f"Found {total_rules} rules. Starting parallel extraction with {self.max_workers} threads...")
+
+        with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
+            futures = {executor.submit(self.extract_rule_details, url, name): name for url, name in rule_links}
+            for future in as_completed(futures):
+                rule_name = futures[future]
+                try:
+                    if result := future.result():
+                        rules.append(result)
+                except Exception as e:
+                    self.logger.error(f"Error processing rule {rule_name}: {e}")
 
         final_json = {
             "checks": self.category.capitalize(),
-            "total_rules": len(rules_data),
-            "rules": rules_data
+            "total_rules": len(rules),
+            "rules": rules
         }
 
         filename = f"{self.category}_checks.json"
         with open(filename, "w", encoding="utf-8") as f:
             json.dump(final_json, f, indent=4, ensure_ascii=False)
 
-        self.logger.info(f"{Fore.GREEN}✅ Extraction complete — {len(rules_data)} rules saved to {filename}{Style.RESET_ALL}")
+        self.logger.info(
+            f"{Fore.GREEN}✅ Extraction complete — {len(rules)} rules saved to {filename}{Style.RESET_ALL}"
+        )
         return final_json
 
 
@@ -179,5 +193,5 @@ class CheckstyleScraper:
 
 if __name__ == "__main__":
     category = input("Enter Checkstyle category (e.g. annotation, coding, naming): ").strip().lower()
-    scraper = CheckstyleScraper(category)
+    scraper = CheckstyleScraper(category, max_workers=10)
     scraper.scrape()
